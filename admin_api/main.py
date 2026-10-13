@@ -1,0 +1,295 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from html import escape
+from typing import Annotated
+
+import httpx
+import jwt
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerifyMismatchError
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select
+from sqlalchemy.orm import selectinload
+
+from admin_api.settings import get_admin_settings
+from database.models import Order, Product, PromoCode, SupportMessage, SupportTicket, User
+from database.session import SessionLocal
+
+app = FastAPI(title="DEXLO Admin API", docs_url=None, redoc_url=None)
+bearer = HTTPBearer(auto_error=False)
+password_hasher = PasswordHasher()
+
+
+class LoginPayload(BaseModel):
+    username: str = Field(max_length=64)
+    password: str = Field(max_length=256)
+
+
+class ReplyPayload(BaseModel):
+    body: str = Field(min_length=1, max_length=2000)
+
+
+class PromoCodePayload(BaseModel):
+    code: str = Field(min_length=3, max_length=40)
+    discount_percent: int = Field(ge=1, le=100)
+    usage_limit: int | None = Field(default=None, ge=1, le=1_000_000)
+
+
+class PromoCodeStatePayload(BaseModel):
+    active: bool
+
+
+def as_iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value else None
+
+
+def user_data(user: User | None) -> dict:
+    if not user:
+        return {"id": None, "telegram_id": None, "username": None, "first_name": "Удалённый пользователь", "bonus_balance_minor": 0}
+    return {"id": user.id, "telegram_id": user.telegram_id, "username": user.username, "first_name": user.first_name, "bonus_balance_minor": user.bonus_balance_minor}
+
+
+def promo_data(item: PromoCode) -> dict:
+    return {
+        "id": item.id,
+        "code": item.code,
+        "discount_percent": item.discount_percent,
+        "usage_limit": item.usage_limit,
+        "used_count": item.used_count,
+        "active": item.active,
+        "expires_at": as_iso(item.expires_at),
+        "created_at": as_iso(item.created_at),
+    }
+
+
+async def require_admin(credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)]) -> str:
+    settings = get_admin_settings()
+    if not settings.configured:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Администратор ещё не настроен")
+    if not credentials:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Требуется авторизация")
+    try:
+        payload = jwt.decode(credentials.credentials, settings.admin_jwt_secret, algorithms=["HS256"])
+        if payload.get("sub") != settings.admin_username:
+            raise ValueError("unknown account")
+    except (jwt.PyJWTError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Сессия истекла") from exc
+    return settings.admin_username
+
+
+Admin = Annotated[str, Depends(require_admin)]
+
+
+async def send_telegram(user: User, text: str) -> None:
+    token = get_admin_settings().bot_token
+    if not token:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": user.telegram_id, "text": text, "parse_mode": "HTML"},
+            )
+            response.raise_for_status()
+    except httpx.HTTPError:
+        # The response is preserved in the database even if a customer blocked the bot.
+        return
+
+
+def ticket_data(ticket: SupportTicket, customer: User | None, message_count: int | None = None) -> dict:
+    return {
+        "id": ticket.id,
+        "public_number": ticket.public_number,
+        "status": ticket.status,
+        "created_at": as_iso(ticket.created_at),
+        "updated_at": as_iso(ticket.updated_at),
+        "closed_at": as_iso(ticket.closed_at),
+        "customer": user_data(customer),
+        "message_count": message_count if message_count is not None else len(ticket.messages),
+    }
+
+
+@app.get("/api/health")
+async def health() -> dict:
+    return {"ok": True}
+
+
+@app.get("/api/auth/status")
+async def auth_status() -> dict:
+    return {"configured": get_admin_settings().configured}
+
+
+@app.post("/api/auth/login")
+async def login(payload: LoginPayload) -> dict:
+    settings = get_admin_settings()
+    if not settings.configured:
+        raise HTTPException(status_code=503, detail="Сначала настройте учётную запись администратора")
+    valid = False
+    if payload.username == settings.admin_username:
+        try:
+            valid = password_hasher.verify(settings.admin_password_hash, payload.password)
+        except (VerifyMismatchError, InvalidHashError):
+            valid = False
+    if not valid:
+        raise HTTPException(status_code=401, detail="Неверное имя пользователя или пароль")
+    now = datetime.now(timezone.utc)
+    token = jwt.encode({"sub": settings.admin_username, "iat": now, "exp": now + timedelta(hours=8)}, settings.admin_jwt_secret, algorithm="HS256")
+    return {"access_token": token, "token_type": "bearer", "expires_in": 8 * 60 * 60}
+
+
+@app.get("/api/dashboard")
+async def dashboard(_: Admin) -> dict:
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(
+                select(func.count(User.id)).scalar_subquery(),
+                select(func.count(Order.id)).scalar_subquery(),
+                select(func.count(SupportTicket.id)).where(SupportTicket.status == "open").scalar_subquery(),
+                select(func.count(Product.id)).where(Product.active.is_(True)).scalar_subquery(),
+            )
+        )
+        users, orders, tickets, products = result.one()
+    return {"users": users, "orders": orders, "open_tickets": tickets, "active_products": products}
+
+
+@app.get("/api/users")
+async def users(_: Admin, limit: int = 100, offset: int = 0) -> dict:
+    limit = min(max(limit, 1), 200)
+    offset = max(offset, 0)
+    async with SessionLocal() as session:
+        total = await session.scalar(select(func.count(User.id))) or 0
+        rows = list((await session.scalars(select(User).order_by(User.created_at.desc()).offset(offset).limit(limit))).all())
+    return {"total": total, "items": [{**user_data(item), "created_at": as_iso(item.created_at)} for item in rows]}
+
+
+@app.get("/api/orders")
+async def orders(_: Admin, limit: int = 100, offset: int = 0) -> dict:
+    limit = min(max(limit, 1), 200)
+    offset = max(offset, 0)
+    async with SessionLocal() as session:
+        total = await session.scalar(select(func.count(Order.id))) or 0
+        rows = list((await session.scalars(select(Order).options(selectinload(Order.items)).order_by(Order.created_at.desc()).offset(offset).limit(limit))).all())
+        customers = {item.user_id: await session.get(User, item.user_id) for item in rows}
+    return {
+        "total": total,
+        "items": [
+            {
+                "id": item.id,
+                "public_number": item.public_number,
+                "status": item.status,
+                "subtotal_minor": item.subtotal_minor,
+                "promo_code": item.promo_code,
+                "promo_discount_minor": item.promo_discount_minor,
+                "bonus_used_minor": item.bonus_used_minor,
+                "bonus_accrued_minor": item.bonus_accrued_minor,
+                "total_minor": item.total_minor,
+                "currency": item.currency,
+                "created_at": as_iso(item.created_at),
+                "customer": user_data(customers[item.user_id]),
+                "items": [{"name": line.product_name_snapshot, "quantity": line.quantity, "total_minor": line.total_minor} for line in item.items],
+            }
+            for item in rows
+        ],
+    }
+
+
+@app.get("/api/promocodes")
+async def promo_codes(_: Admin) -> dict:
+    async with SessionLocal() as session:
+        rows = list((await session.scalars(select(PromoCode).order_by(PromoCode.created_at.desc()))).all())
+    return {"items": [promo_data(item) for item in rows]}
+
+
+@app.post("/api/promocodes", status_code=status.HTTP_201_CREATED)
+async def create_promo_code(payload: PromoCodePayload, _: Admin) -> dict:
+    code = "".join(payload.code.upper().split())
+    if not code or not all(char.isalnum() or char in "-_" for char in code):
+        raise HTTPException(status_code=422, detail="Код: латинские буквы, цифры, «-» или «_»")
+    async with SessionLocal() as session, session.begin():
+        if await session.scalar(select(PromoCode.id).where(PromoCode.code == code)):
+            raise HTTPException(status_code=409, detail="Такой промокод уже существует")
+        item = PromoCode(code=code, discount_percent=payload.discount_percent, usage_limit=payload.usage_limit)
+        session.add(item)
+        await session.flush()
+        data = promo_data(item)
+    return data
+
+
+@app.post("/api/promocodes/{promo_id}/state")
+async def set_promo_code_state(promo_id: int, payload: PromoCodeStatePayload, _: Admin) -> dict:
+    async with SessionLocal() as session, session.begin():
+        item = await session.get(PromoCode, promo_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Промокод не найден")
+        item.active = payload.active
+        await session.flush()
+        data = promo_data(item)
+    return data
+
+
+@app.get("/api/tickets")
+async def tickets(_: Admin, include_closed: bool = True, limit: int = 100) -> dict:
+    limit = min(max(limit, 1), 200)
+    async with SessionLocal() as session:
+        stmt = select(SupportTicket).order_by(SupportTicket.updated_at.desc()).limit(limit)
+        if not include_closed:
+            stmt = stmt.where(SupportTicket.status == "open")
+        rows = list((await session.scalars(stmt)).all())
+        customers = {item.user_id: await session.get(User, item.user_id) for item in rows}
+        counts = {
+            ticket_id: count
+            for ticket_id, count in (await session.execute(select(SupportMessage.ticket_id, func.count(SupportMessage.id)).where(SupportMessage.ticket_id.in_([item.id for item in rows])).group_by(SupportMessage.ticket_id))).all()
+        } if rows else {}
+    return {"items": [ticket_data(item, customers[item.user_id], counts.get(item.id, 0)) for item in rows]}
+
+
+@app.get("/api/tickets/{ticket_id}")
+async def ticket(ticket_id: int, _: Admin) -> dict:
+    async with SessionLocal() as session:
+        item = await session.scalar(select(SupportTicket).options(selectinload(SupportTicket.messages)).where(SupportTicket.id == ticket_id))
+        if not item:
+            raise HTTPException(status_code=404, detail="Обращение не найдено")
+        customer = await session.get(User, item.user_id)
+        data = ticket_data(item, customer)
+        data["messages"] = [
+            {"id": message.id, "sender_kind": message.sender_kind, "body": message.body, "created_at": as_iso(message.created_at)}
+            for message in item.messages
+        ]
+    return data
+
+
+@app.post("/api/tickets/{ticket_id}/reply")
+async def reply(ticket_id: int, payload: ReplyPayload, _: Admin) -> dict:
+    body = payload.body.strip()
+    if not body:
+        raise HTTPException(status_code=422, detail="Введите текст ответа")
+    async with SessionLocal() as session, session.begin():
+        item = await session.get(SupportTicket, ticket_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Обращение не найдено")
+        if item.status != "open":
+            raise HTTPException(status_code=409, detail="Обращение закрыто")
+        customer = await session.get(User, item.user_id)
+        session.add(SupportMessage(ticket_id=item.id, sender_kind="admin_web", sender_telegram_id=None, body=body))
+        item.updated_at = datetime.now(timezone.utc)
+    if customer:
+        await send_telegram(customer, f"<b>Ответ поддержки · {escape(item.public_number)}</b>\n\n{escape(body)}")
+    return {"ok": True}
+
+
+@app.post("/api/tickets/{ticket_id}/close")
+async def close_ticket(ticket_id: int, _: Admin) -> dict:
+    async with SessionLocal() as session, session.begin():
+        item = await session.get(SupportTicket, ticket_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Обращение не найдено")
+        customer = await session.get(User, item.user_id)
+        if item.status == "open":
+            now = datetime.now(timezone.utc)
+            item.status, item.closed_at, item.updated_at = "closed", now, now
+    if customer:
+        await send_telegram(customer, f"<b>Обращение {escape(item.public_number)} закрыто</b>\nЕсли вопрос останется, создайте новое обращение в разделе «Поддержка».")
+    return {"ok": True}

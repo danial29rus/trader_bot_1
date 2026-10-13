@@ -1,0 +1,23 @@
+{
+	# IP certificates are short-lived. Caddy renews them automatically.
+	acme_ca https://acme-v02.api.letsencrypt.org/directory
+	fallback_sni 2.27.42.108
+}
+
+https://2.27.42.108 {
+	tls {
+		issuer acme {
+			dir https://acme-v02.api.letsencrypt.org/directory
+			profile shortlived
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+	}
+
+	reverse_proxy admin-web:80
+}
