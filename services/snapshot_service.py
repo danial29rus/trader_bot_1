@@ -16,7 +16,7 @@ import math
 import re
 import time
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import ROUND_UP, Decimal
 from typing import Any
 
 from sqlalchemy import func, select, update
@@ -42,6 +42,10 @@ GIFT_CARD_BRANDS = (
 STAR_PACKS = (50, 100, 250, 500, 1000, 2500, 5000, 10000)
 TELEGRAM_USERNAME_FIELD = {"key": "telegram_username", "label": "Username получателя в Telegram (например, @durov)", "type": "text"}
 SECTIONS = ("telegram", "topups", "giftcards")
+SUPPLIER_ORIGIN = "https://resell.codes"
+# Regions most buyers need come first; the rest follow alphabetically.
+POPULAR_REGIONS = ("GLOBAL", "RU", "CIS", "KZ", "TR", "US", "GB", "UK", "EU", "DE", "PL", "UA", "AE", "IN", "BR")
+VARIANTS = {"auto": "авто", "fast": "быстро", "manual": "вручную", "reserve": "резерв"}
 
 
 class BudgetExhausted(RuntimeError):
@@ -120,11 +124,11 @@ def parse_star_packs(payload: dict[str, Any]) -> list[tuple[int, str]]:
             packs.append((int(quantity), str(price)))
     if packs:
         return sorted(packs)
-    unit = _first(payload, "price_per_star_usd", "star_price_usd", "usd_per_star", "price_usd", "rate")
+    unit = _first(payload, "price_per_star", "price_per_star_usd", "star_price_usd", "usd_per_star", "price_usd", "rate")
     if unit is None:
         return []
     low, high = int(_first(payload, "min_quantity", "min") or 50), int(_first(payload, "max_quantity", "max") or 10000)
-    return [(q, str((Decimal(str(unit)) * q).quantize(Decimal("0.0001")))) for q in STAR_PACKS if low <= q <= high]
+    return [(q, str((Decimal(str(unit)) * q).quantize(Decimal("0.0001"), rounding=ROUND_UP))) for q in STAR_PACKS if low <= q <= high]
 
 
 def parse_premium_plans(payload: dict[str, Any]) -> list[tuple[int, str]]:
@@ -140,8 +144,26 @@ def parse_premium_plans(payload: dict[str, Any]) -> list[tuple[int, str]]:
     return sorted(p for p in plans if p[0] > 0)
 
 
+def image_url(path: str | None) -> str | None:
+    """Supplier images come as site-relative paths; Telegram needs an absolute URL."""
+    if not path:
+        return None
+    return path if path.startswith(("http://", "https://")) else SUPPLIER_ORIGIN + "/" + path.lstrip("/")
+
+
+def region_order(region: str | None) -> int:
+    code = (region or "GLOBAL").upper()
+    return POPULAR_REGIONS.index(code) if code in POPULAR_REGIONS else 1000
+
+
+def product_name(brand: str, offer: str) -> str:
+    return offer if brand.casefold() in offer.casefold() else f"{brand} {offer}"
+
+
 def region_label(region: str | None, variant: str | None = None) -> str:
     code = (region or "GLOBAL").upper()
+    code = "GB" if code == "UK" else code
+    variant = VARIANTS.get((variant or "").casefold(), variant)
     if code in {"GLOBAL", "WW", "WORLDWIDE"}:
         label = "🌍 Global"
     elif code == "CIS":
@@ -213,7 +235,7 @@ async def _brand_snapshot(
             if not name or name.casefold() in seen or not _matches(query, name) or not subcategories:
                 continue
             seen.add(name.casefold())
-            image = next((s.get("image") for s in subcategories if s.get("image")), None)
+            image = image_url(next((s.get("image") for s in subcategories if s.get("image")), None))
             parent = await get_category(session, name, kind, f"brand-{name}", image=image, sort_order=order)
             for sub in subcategories:
                 supplier_id = str(sub["category_id"])
@@ -233,17 +255,21 @@ async def _brand_snapshot(
                     result.counters["skipped"] += 1
                     continue
                 single = len(subcategories) == 1
+                sub_image = image_url(sub.get("image") or details.get("image")) or image
                 target = parent if single else await get_category(
-                    session, region_label(sub.get("region"), sub.get("variant") or None), kind, supplier_id, parent.id, image=sub.get("image") or image,
+                    session, region_label(sub.get("region"), sub.get("variant") or None), kind, supplier_id, parent.id,
+                    image=sub_image, sort_order=region_order(sub.get("region")),
                 )
                 fields = details.get("fields") or []
+                note = str(details.get("note") or "").strip() or None
                 for offer in offers:
                     ok = await upsert_product(
-                        session, target, product_type, f"{supplier_id}:{offer[offer_id_key]}", str(offer.get("name") or name),
+                        session, target, product_type, f"{supplier_id}:{offer[offer_id_key]}", product_name(name, str(offer.get("name") or name)),
                         {"brand": name, "subcategory": sub, "offer": offer, "fields": fields},
                         price_usd=offer["price_usd"], price=(pricing.rub_minor(offer["price_usd"]), "RUB"),
-                        image=sub.get("image") or image, region=(sub.get("region") or "GLOBAL"), platform=name,
+                        image=sub_image, region=(sub.get("region") or "GLOBAL"), platform=name,
                         activation=activation, stock=offer.get("stock"),
+                        description=f"Условия поставщика:\n{note}" if note else None,
                     )
                     result.counters["imported" if ok else "skipped"] += 1
                 await session.commit()
