@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 from html import escape
 from pathlib import Path
@@ -22,6 +23,8 @@ from services.legal import payment_and_refunds, prices_and_tariffs, privacy_poli
 router = Router()
 settings = get_settings()
 PAGE_SIZE = 6
+_welcome_photo_file_id: str | None = None
+_welcome_photo_lock = asyncio.Lock()
 
 
 async def user_for(session: AsyncSession, message: Message | CallbackQuery) -> User:
@@ -96,24 +99,53 @@ async def main_text() -> str:
     )
 
 
+async def send_welcome(message: Message, caption: str) -> None:
+    """Reuse Telegram's CDN copy instead of uploading the local banner per /start."""
+    global _welcome_photo_file_id
+
+    if _welcome_photo_file_id:
+        await message.answer_photo(
+            photo=_welcome_photo_file_id,
+            caption=caption,
+            reply_markup=main_menu(),
+            parse_mode="HTML",
+        )
+        return
+
+    image = next(
+        (candidate for candidate in (Path("assets/welcome.png"), Path("assets/welcome.jpg")) if candidate.exists()),
+        None,
+    )
+    if not image:
+        await message.answer(caption, reply_markup=main_menu(), parse_mode="HTML")
+        return
+
+    # A burst of /start messages must not trigger several banner uploads.
+    async with _welcome_photo_lock:
+        if _welcome_photo_file_id:
+            await message.answer_photo(
+                photo=_welcome_photo_file_id,
+                caption=caption,
+                reply_markup=main_menu(),
+                parse_mode="HTML",
+            )
+            return
+        sent = await message.answer_photo(
+            photo=FSInputFile(image),
+            caption=caption,
+            reply_markup=main_menu(),
+            parse_mode="HTML",
+        )
+        if sent.photo:
+            _welcome_photo_file_id = sent.photo[-1].file_id
+
+
 @router.message(CommandStart())
 async def start(message: Message) -> None:
     async with SessionLocal() as session, session.begin():
         await user_for(session, message)
     welcome = await main_text()
-    image = next(
-        (candidate for candidate in (Path("assets/welcome.png"), Path("assets/welcome.jpg")) if candidate.exists()),
-        None,
-    )
-    if image:
-        await message.answer_photo(
-            photo=FSInputFile(image),
-            caption=welcome,
-            reply_markup=main_menu(),
-            parse_mode="HTML",
-        )
-        return
-    await message.answer(welcome, reply_markup=main_menu(), parse_mode="HTML")
+    await send_welcome(message, welcome)
 
 
 @router.callback_query(F.data == "menu")
