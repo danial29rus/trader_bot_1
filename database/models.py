@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from decimal import Decimal
+
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -30,6 +32,9 @@ class Category(Base):
     parent_id: Mapped[int | None] = mapped_column(ForeignKey("categories.id"))
     type: Mapped[str] = mapped_column(String(40))
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    image_url: Mapped[str | None] = mapped_column(Text)
+    # Lower first; snapshot keeps popular brands in the order they were listed.
+    sort_order: Mapped[int] = mapped_column(Integer, default=1000, server_default="1000")
     products: Mapped[list[Product]] = relationship(back_populates="category")
 
 
@@ -49,6 +54,9 @@ class Product(Base):
     activation_type: Mapped[str | None] = mapped_column(String(100))
     price_minor: Mapped[int] = mapped_column(BigInteger)
     currency: Mapped[str] = mapped_column(String(3), default="RUB")
+    supplier_price_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    # Set when an operator edits the price; imports then keep the manual price.
+    price_locked: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     available_by_import: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

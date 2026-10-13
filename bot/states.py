@@ -12,3 +12,7 @@ class Support(StatesGroup):
 
 class Checkout(StatesGroup):
     waiting_promo = State()
+
+
+class CartInput(StatesGroup):
+    waiting_value = State()

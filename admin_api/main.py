@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from html import escape
 from typing import Annotated
 
@@ -46,6 +48,17 @@ class ProductStatePayload(BaseModel):
     active: bool
 
 
+class ProductPricePayload(BaseModel):
+    price_rub: Decimal = Field(gt=0, le=10_000_000)
+
+
+class RepricePayload(BaseModel):
+    product_type: str = ""
+    rub_per_usd: Decimal = Field(gt=0, le=10_000)
+    markup_percent: Decimal = Field(ge=-50, le=500)
+    include_locked: bool = False
+
+
 def as_iso(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
@@ -77,6 +90,8 @@ def product_data(item: Product) -> dict:
         "region": item.region,
         "price_minor": item.price_minor,
         "currency": item.currency,
+        "supplier_price_usd": str(item.supplier_price_usd) if item.supplier_price_usd is not None else None,
+        "price_locked": item.price_locked,
         "active": item.active,
     }
 
@@ -213,12 +228,14 @@ async def orders(_: Admin, limit: int = 100, offset: int = 0) -> dict:
 
 
 @app.get("/api/products")
-async def products(_: Admin, query: str = "", limit: int = 200) -> dict:
+async def products(_: Admin, query: str = "", product_type: str = "", limit: int = 200) -> dict:
     limit = min(max(limit, 1), 200)
     async with SessionLocal() as session:
         stmt = select(Product).order_by(Product.active.desc(), Product.name.asc()).limit(limit)
         if query.strip():
             stmt = stmt.where(Product.name.ilike(f"%{query.strip()}%"))
+        if product_type:
+            stmt = stmt.where(Product.product_type == product_type)
         rows = list((await session.scalars(stmt)).all())
     return {"items": [product_data(item) for item in rows]}
 
@@ -233,6 +250,38 @@ async def set_product_state(product_id: int, payload: ProductStatePayload, _: Ad
         await session.flush()
         data = product_data(item)
     return data
+
+
+@app.post("/api/products/{product_id}/price")
+async def set_product_price(product_id: int, payload: ProductPricePayload, _: Admin) -> dict:
+    """A manual price is locked: later catalogue imports keep it."""
+    async with SessionLocal() as session, session.begin():
+        item = await session.get(Product, product_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Товар не найден")
+        item.price_minor = int((payload.price_rub * 100).to_integral_value())
+        item.currency = "RUB"
+        item.price_locked = True
+        await session.flush()
+        data = product_data(item)
+    return data
+
+
+@app.post("/api/products/reprice")
+async def reprice_products(payload: RepricePayload, _: Admin) -> dict:
+    """Recalculate RUB prices from the stored supplier price: USD × rate × (1 + markup), rounded up to whole roubles."""
+    factor = payload.rub_per_usd * (1 + payload.markup_percent / 100)
+    async with SessionLocal() as session, session.begin():
+        stmt = select(Product).where(Product.supplier_price_usd.is_not(None))
+        if payload.product_type:
+            stmt = stmt.where(Product.product_type == payload.product_type)
+        if not payload.include_locked:
+            stmt = stmt.where(Product.price_locked.is_(False))
+        rows = list((await session.scalars(stmt)).all())
+        for item in rows:
+            item.price_minor = math.ceil(item.supplier_price_usd * factor) * 100
+            item.currency = "RUB"
+    return {"updated": len(rows)}
 
 
 @app.get("/api/promocodes")

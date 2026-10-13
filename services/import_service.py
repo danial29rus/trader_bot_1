@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 import httpx
-from sqlalchemy import select, update
+from sqlalchemy import case, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -70,26 +70,40 @@ def select_steam_offers(details: dict[str, Any], allowed_regions: set[str]) -> t
     return [(offer, region_data) for _, _, offer, region_data in selected.values()], duplicates
 
 
-async def get_category(session: AsyncSession, name: str, kind: str, identifier: str, parent_id: int | None = None) -> Category:
+async def get_category(session: AsyncSession, name: str, kind: str, identifier: str, parent_id: int | None = None, *, image: str | None = None, sort_order: int | None = None) -> Category:
     category_slug = slug(kind, identifier)
     category = await session.scalar(select(Category).where(Category.slug == category_slug))
     if not category:
-        category = Category(name=name[:255], slug=category_slug, parent_id=parent_id, type=kind, active=True)
+        category = Category(name=name[:255], slug=category_slug, parent_id=parent_id, type=kind, active=True, image_url=image, sort_order=1000 if sort_order is None else sort_order)
         session.add(category)
         await session.flush()
     else:
         category.name, category.active = name[:255], True
+        if parent_id is not None:
+            category.parent_id = parent_id
+        if image:
+            category.image_url = image
+        if sort_order is not None:
+            category.sort_order = sort_order
     return category
 
 
-async def upsert_product(session: AsyncSession, category: Category, product_type: str, external_id: str, name: str, raw: dict[str, Any], *, price_usd: str | None, image: str | None = None, platform: str | None = None, region: str | None = None, activation: str | None = None, stock: int | None = None, description: str | None = None) -> bool:
-    price = price_fields(price_usd)
+async def upsert_product(session: AsyncSession, category: Category, product_type: str, external_id: str, name: str, raw: dict[str, Any], *, price_usd: str | None, image: str | None = None, platform: str | None = None, region: str | None = None, activation: str | None = None, stock: int | None = None, description: str | None = None, price: tuple[int, str] | None = None) -> bool:
+    price = price or price_fields(price_usd)
     if not price:
         return False
     minor, currency = price
-    statement = insert(Product).values(category_id=category.id, supplier="resellcodes", external_id=str(external_id), product_type=product_type, name=name[:500], description=description, image_url=image, platform=platform, region=region, activation_type=activation, price_minor=minor, currency=currency, available_by_import=(stock > 0 if stock is not None else None), active=True, imported_at=datetime.now(timezone.utc), raw_payload=raw)
-    # Keep the operator's manual publication decision on future catalogue imports.
-    statement = statement.on_conflict_do_update(constraint="uq_product_external", set_={"category_id": category.id, "name": name[:500], "description": description, "image_url": image, "platform": platform, "region": region, "activation_type": activation, "price_minor": minor, "currency": currency, "available_by_import": (stock > 0 if stock is not None else None), "imported_at": datetime.now(timezone.utc), "raw_payload": raw})
+    supplier_usd = Decimal(str(price_usd)) if price_usd is not None else None
+    statement = insert(Product).values(category_id=category.id, supplier="resellcodes", external_id=str(external_id), product_type=product_type, name=name[:500], description=description, image_url=image, platform=platform, region=region, activation_type=activation, price_minor=minor, currency=currency, supplier_price_usd=supplier_usd, available_by_import=(stock > 0 if stock is not None else None), active=True, imported_at=datetime.now(timezone.utc), raw_payload=raw)
+    # Keep the operator's publication decision and any manually edited price on re-imports.
+    locked = Product.__table__.c.price_locked
+    statement = statement.on_conflict_do_update(constraint="uq_product_external", set_={
+        "category_id": category.id, "name": name[:500], "description": description, "image_url": image, "platform": platform,
+        "region": region, "activation_type": activation, "supplier_price_usd": supplier_usd,
+        "price_minor": case((locked, Product.__table__.c.price_minor), else_=statement.excluded.price_minor),
+        "currency": case((locked, Product.__table__.c.currency), else_=statement.excluded.currency),
+        "available_by_import": (stock > 0 if stock is not None else None), "imported_at": datetime.now(timezone.utc), "raw_payload": raw,
+    })
     await session.execute(statement)
     return True
 
@@ -121,27 +135,8 @@ async def import_catalog(session: AsyncSession) -> dict[str, int]:
 
     try:
         async with ReSellCodesClient(get_settings().resellcodes_api_key) as api:
-            # Query individual popular brands, then validate their stable category-ID prefixes.
-            card_categories: dict[str, dict[str, Any]] = {}
-            for query in settings.gift_card_search_queries:
-                for item in await api.list_all("/gift-cards/categories", {"q": query}):
-                    if item.get("category_id"):
-                        card_categories[item["category_id"]] = item
-            for item in card_categories.values():
-                category_id = item.get("category_id", "").casefold()
-                brand_matches = any(category_id.startswith(prefix) for prefix in settings.gift_card_id_prefixes)
-                region_matches = any(category_id.endswith(suffix) for suffix in settings.gift_card_region_suffixes)
-                if not brand_matches or not region_matches:
-                    counters["skipped"] += 1
-                    continue
-                details = await detail_or_skip(api, f"/gift-cards/categories/{item['category_id']}/cards", f"gift card category {item['category_id']}")
-                if details is None:
-                    continue
-                category = await get_category(session, item["name"], "gift_card", item["category_id"])
-                offers = details.get("offers", [])
-                for offer in offers:
-                    ok = await upsert_product(session, category, "gift_card", f"{item['category_id']}:{offer['card_id']}", offer.get("name", item["name"]), {"category": item, "offer": offer}, price_usd=offer.get("price_usd"), image=item.get("image"), stock=offer.get("stock"), activation="code")
-                    counters["imported" if ok else "skipped"] += 1
+            # Gift cards belong to the one-off snapshot (scripts/snapshot_import.py): it builds the
+            # brand → region tree and applies the markup, which a pass here would overwrite.
             # Keys have no documented popularity signal. They are opt-in and restricted to Steam.
             if settings.import_steam_keys:
                 category = await get_category(session, "Steam-ключи", "game_key", "steam-keys")
