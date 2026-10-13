@@ -42,6 +42,10 @@ class PromoCodeStatePayload(BaseModel):
     active: bool
 
 
+class ProductStatePayload(BaseModel):
+    active: bool
+
+
 def as_iso(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
@@ -62,6 +66,18 @@ def promo_data(item: PromoCode) -> dict:
         "active": item.active,
         "expires_at": as_iso(item.expires_at),
         "created_at": as_iso(item.created_at),
+    }
+
+
+def product_data(item: Product) -> dict:
+    return {
+        "id": item.id,
+        "name": item.name,
+        "product_type": item.product_type,
+        "region": item.region,
+        "price_minor": item.price_minor,
+        "currency": item.currency,
+        "active": item.active,
     }
 
 
@@ -194,6 +210,29 @@ async def orders(_: Admin, limit: int = 100, offset: int = 0) -> dict:
             for item in rows
         ],
     }
+
+
+@app.get("/api/products")
+async def products(_: Admin, query: str = "", limit: int = 200) -> dict:
+    limit = min(max(limit, 1), 200)
+    async with SessionLocal() as session:
+        stmt = select(Product).order_by(Product.active.desc(), Product.name.asc()).limit(limit)
+        if query.strip():
+            stmt = stmt.where(Product.name.ilike(f"%{query.strip()}%"))
+        rows = list((await session.scalars(stmt)).all())
+    return {"items": [product_data(item) for item in rows]}
+
+
+@app.post("/api/products/{product_id}/state")
+async def set_product_state(product_id: int, payload: ProductStatePayload, _: Admin) -> dict:
+    async with SessionLocal() as session, session.begin():
+        item = await session.get(Product, product_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Товар не найден")
+        item.active = payload.active
+        await session.flush()
+        data = product_data(item)
+    return data
 
 
 @app.get("/api/promocodes")

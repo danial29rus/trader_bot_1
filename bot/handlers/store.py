@@ -62,9 +62,7 @@ def product_text(product: Product) -> str:
     if product.description:
         fields.append(escape(product.description[:700]))
     fields.append(f"Цена: <b>{catalog_service.money(product.price_minor, product.currency)}</b>")
-    availability = "в наличии" if product.available_by_import is True else "нет данных" if product.available_by_import is None else "нет в наличии"
-    fields.append(f"Наличие по последнему импорту: {availability}")
-    fields.append("Цена и наличие по состоянию на импорт.")
+    fields.append("Статус: <b>В наличии</b>")
     return "\n".join(fields)
 
 
@@ -197,7 +195,7 @@ async def render_list(callback: CallbackQuery, category_id: int, page: int) -> N
     if page < pages: controls.append(("➡️", f"list:{category_id}:{page + 1}"))
     buttons += [controls, nav()]
     title = escape(category.name) if category else "Каталог"
-    await render(callback, f"<b>{title}</b>\n{total} предложений · от дешёвых к дорогим · страница {page}/{pages}\n<i>Цена и наличие указаны по последнему импорту.</i>", kb(*buttons))
+    await render(callback, f"<b>{title}</b>\n{total} предложений · от дешёвых к дорогим · страница {page}/{pages}", kb(*buttons))
 
 
 @router.callback_query(F.data.startswith("list:"))

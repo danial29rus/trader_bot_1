@@ -88,7 +88,8 @@ async def upsert_product(session: AsyncSession, category: Category, product_type
         return False
     minor, currency = price
     statement = insert(Product).values(category_id=category.id, supplier="resellcodes", external_id=str(external_id), product_type=product_type, name=name[:500], description=description, image_url=image, platform=platform, region=region, activation_type=activation, price_minor=minor, currency=currency, available_by_import=(stock > 0 if stock is not None else None), active=True, imported_at=datetime.now(timezone.utc), raw_payload=raw)
-    statement = statement.on_conflict_do_update(constraint="uq_product_external", set_={"category_id": category.id, "name": name[:500], "description": description, "image_url": image, "platform": platform, "region": region, "activation_type": activation, "price_minor": minor, "currency": currency, "available_by_import": (stock > 0 if stock is not None else None), "active": True, "imported_at": datetime.now(timezone.utc), "raw_payload": raw})
+    # Keep the operator's manual publication decision on future catalogue imports.
+    statement = statement.on_conflict_do_update(constraint="uq_product_external", set_={"category_id": category.id, "name": name[:500], "description": description, "image_url": image, "platform": platform, "region": region, "activation_type": activation, "price_minor": minor, "currency": currency, "available_by_import": (stock > 0 if stock is not None else None), "imported_at": datetime.now(timezone.utc), "raw_payload": raw})
     await session.execute(statement)
     return True
 
