@@ -23,7 +23,7 @@ SECTIONS: dict[str, tuple[str, str, int, tuple[int, int, int]]] = {
     "menu": ("DEXLO", "Игры и подарочные карты", 0, (90, 170, 255)),
     "steam": ("STEAM", "Игры и подарки Steam", 0, (102, 192, 244)),
     "cards": ("GIFT CARDS", "Подарочные карты сервисов", 60, (178, 120, 255)),
-    "telegram": ("TELEGRAM", "Stars и Premium", -12, (60, 180, 240)),
+    "telegram": ("TELEGRAM", "Premium", -12, (60, 180, 240)),
     "topup": ("TOP-UP", "Пополнение игр", 105, (255, 90, 200)),
     "catalog": ("CATALOG", "Каталог предложений", 20, (120, 150, 255)),
     "search": ("SEARCH", "Поиск по каталогу", -30, (70, 220, 230)),

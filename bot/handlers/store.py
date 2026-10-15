@@ -123,7 +123,7 @@ async def main_text() -> str:
         count = await session.scalar(select(func.count()).select_from(Product).where(Product.active)) or 0
     return (
         f"<b>{escape(settings.store_name)}</b> — цифровой магазин игр\n\n"
-        "⭐ Telegram Stars и Premium\n"
+        "💎 Telegram Premium\n"
         "⚡ Пополнение популярных игр\n"
         "🎁 Подарочные карты: PlayStation, Xbox, Apple и другие\n"
         "🎮 Игры и подарки Steam\n"
@@ -146,7 +146,7 @@ async def menu(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 SECTION_TITLES = {
-    "telegram": ("⭐ <b>Telegram</b>", "Звёзды и Premium на любой аккаунт по username."),
+    "telegram": ("💎 <b>Telegram Premium</b>", "Подписка Premium на любой аккаунт по username."),
     "game_topup": ("⚡ <b>Пополнение игр</b>", "Валюта зачисляется на игровой аккаунт по ID. Выберите игру:"),
     "gift_card": ("🎁 <b>Подарочные карты</b>", "Коды для магазинов и сервисов. Выберите бренд:"),
     "steam_gift": ("🎮 <b>Игры Steam</b>", "Выберите категорию:"),

@@ -1,4 +1,4 @@
-"""One-off catalogue snapshot: Telegram Stars/Premium, game top-ups and gift cards.
+"""One-off catalogue snapshot: Telegram Premium, game top-ups and gift cards.
 
 Look at the real response shapes first (about 7 requests):
     docker compose run --rm bot python -m scripts.snapshot_import --probe

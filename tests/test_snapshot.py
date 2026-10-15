@@ -1,19 +1,12 @@
 from decimal import Decimal
 
 from bot.handlers.store import validate_field
-from services.snapshot_service import Pricing, image_url, parse_premium_plans, parse_star_packs, product_name, region_label, region_order
+from services.snapshot_service import Pricing, image_url, parse_premium_plans, product_name, region_label, region_order
 
 
 def test_pricing_rounds_up_to_whole_roubles():
     assert Pricing(Decimal("95"), Decimal("15")).rub_minor("1.50") == 16400
     assert Pricing(Decimal("100"), Decimal("0")).rub_minor("1.00") == 10000
-
-
-def test_star_packs_from_pack_list_or_unit_price():
-    assert parse_star_packs({"data": [{"stars": 100, "price_usd": "1.6"}, {"stars": 50, "price_usd": "0.8"}]}) == [(50, "0.8"), (100, "1.6")]
-    packs = parse_star_packs({"price_per_star_usd": "0.015", "min_quantity": 50, "max_quantity": 1000})
-    assert packs[0] == (50, "0.7500") and packs[-1][0] == 1000
-    assert parse_star_packs({"unexpected": True}) == []
 
 
 def test_premium_plans_shapes():
@@ -41,8 +34,6 @@ def test_russian_plurals():
 
 def test_real_supplier_shapes():
     """Shapes taken from a --probe run against the live API (2026-10-14)."""
-    stars = parse_star_packs({"object": "telegram_stars_pricing", "price_per_star": "0.0152250", "min": 50, "max": 10000})
-    assert stars[0] == (50, "0.7613") and stars[-1][0] == 10000 and len(stars) == 8
     assert parse_premium_plans({"plans": [{"months": 3, "price_usd": "12.1698"}, {"months": 12, "price_usd": "29.4248"}]}) == [(3, "12.1698"), (12, "29.4248")]
     assert image_url("/api/media/x.webp") == "https://resell.codes/api/media/x.webp"
     assert image_url("https://cdn/x.png") == "https://cdn/x.png"

@@ -16,7 +16,7 @@ import math
 import re
 import time
 from dataclasses import dataclass, field
-from decimal import ROUND_UP, Decimal
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import func, select, update
@@ -39,7 +39,6 @@ GIFT_CARD_BRANDS = (
     "PlayStation", "Xbox", "Nintendo", "Steam", "Apple", "Google Play", "Roblox", "Spotify",
     "Netflix", "Razer Gold", "Riot", "Blizzard", "EA", "Ubisoft", "Amazon", "Discord", "Fortnite", "Minecraft",
 )
-STAR_PACKS = (50, 100, 250, 500, 1000, 2500, 5000, 10000)
 TELEGRAM_USERNAME_FIELD = {"key": "telegram_username", "label": "Username получателя в Telegram (например, @durov)", "type": "text"}
 SECTIONS = ("telegram", "topups", "giftcards")
 SUPPLIER_ORIGIN = "https://resell.codes"
@@ -115,22 +114,6 @@ def _items(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
-def parse_star_packs(payload: dict[str, Any]) -> list[tuple[int, str]]:
-    """(stars, price_usd) pairs. The docs only promise "live pricing", so accept a pack list or a per-star price."""
-    packs = []
-    for item in _items(payload):
-        quantity, price = _first(item, "quantity", "stars", "amount", "count"), _first(item, "price_usd", "usd", "price")
-        if quantity and price is not None:
-            packs.append((int(quantity), str(price)))
-    if packs:
-        return sorted(packs)
-    unit = _first(payload, "price_per_star", "price_per_star_usd", "star_price_usd", "usd_per_star", "price_usd", "rate")
-    if unit is None:
-        return []
-    low, high = int(_first(payload, "min_quantity", "min") or 50), int(_first(payload, "max_quantity", "max") or 10000)
-    return [(q, str((Decimal(str(unit)) * q).quantize(Decimal("0.0001"), rounding=ROUND_UP))) for q in STAR_PACKS if low <= q <= high]
-
-
 def parse_premium_plans(payload: dict[str, Any]) -> list[tuple[int, str]]:
     plans = []
     for item in _items(payload):
@@ -190,20 +173,9 @@ async def snapshot_telegram(api: PacedClient, session: AsyncSession, pricing: Pr
     root = await get_category(session, "Telegram", "telegram", "root", sort_order=0)
     raw_fields = [TELEGRAM_USERNAME_FIELD]
 
-    stars = parse_star_packs(await api.get("/telegram/stars"))
-    if stars:
-        category = await get_category(session, "⭐ Telegram Stars", "telegram", "stars", root.id, sort_order=0)
-        for quantity, usd in stars:
-            ok = await upsert_product(session, category, "telegram", f"stars:{quantity}", f"⭐ {quantity} Stars", {"kind": "stars", "quantity": quantity, "fields": raw_fields},
-                                      price_usd=usd, price=(pricing.rub_minor(usd), "RUB"), platform="Telegram", activation="На аккаунт по username",
-                                      description="Звёзды зачисляются на аккаунт получателя по username. Пароль и код входа не нужны.")
-            result.counters["imported" if ok else "skipped"] += 1
-    else:
-        result.warnings.append("telegram stars: unknown response shape, nothing imported (run --probe)")
-
     premium = parse_premium_plans(await api.get("/telegram/premium"))
     if premium:
-        category = await get_category(session, "💎 Telegram Premium", "telegram", "premium", root.id, sort_order=1)
+        category = await get_category(session, "💎 Telegram Premium", "telegram", "premium", root.id, sort_order=0)
         for months, usd in premium:
             ok = await upsert_product(session, category, "telegram", f"premium:{months}", f"💎 Premium · {months} мес.", {"kind": "premium", "months": months, "fields": raw_fields},
                                       price_usd=usd, price=(pricing.rub_minor(usd), "RUB"), platform="Telegram", activation="Подарок на аккаунт по username",
@@ -329,7 +301,6 @@ async def probe(api_key: str) -> dict[str, Any]:
         me = await take("me", "/me")
         if isinstance(me, dict):
             me.pop("email", None)
-        await take("telegram_stars", "/telegram/stars")
         await take("telegram_premium", "/telegram/premium")
         topups = await take("topup_brands_pubg", "/top-ups/brands", {"q": "PUBG"})
         cards = await take("giftcard_brands_playstation", "/gift-cards/brands", {"q": "PlayStation"})
@@ -345,4 +316,3 @@ async def probe(api_key: str) -> dict[str, Any]:
 async def count_by_section(session: AsyncSession) -> dict[str, int]:
     rows = await session.execute(select(Product.product_type, func.count()).where(Product.active).group_by(Product.product_type))
     return {kind: count for kind, count in rows.all()}
-
